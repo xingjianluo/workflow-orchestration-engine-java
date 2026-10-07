@@ -18,6 +18,11 @@ public class EngineProperties {
     private String storeDir = "target/workflow-store";
     /** 启动时是否从磁盘恢复 */
     private boolean recoverOnStartup = true;
+    /**
+     * 引擎级默认单次执行超时上限（毫秒）：当流程定义未指定任何上限时生效；
+     * 0（默认）= 无上限，行为与引入超时能力前完全一致
+     */
+    private long defaultExecutionTimeoutMillis = 0L;
 
     public long getLeaseTtlMillis() { return leaseTtlMillis; }
     public void setLeaseTtlMillis(long leaseTtlMillis) { this.leaseTtlMillis = leaseTtlMillis; }
@@ -29,4 +34,6 @@ public class EngineProperties {
     public void setStoreDir(String storeDir) { this.storeDir = storeDir; }
     public boolean isRecoverOnStartup() { return recoverOnStartup; }
     public void setRecoverOnStartup(boolean recoverOnStartup) { this.recoverOnStartup = recoverOnStartup; }
+    public long getDefaultExecutionTimeoutMillis() { return defaultExecutionTimeoutMillis; }
+    public void setDefaultExecutionTimeoutMillis(long defaultExecutionTimeoutMillis) { this.defaultExecutionTimeoutMillis = defaultExecutionTimeoutMillis; }
 }

@@ -10,6 +10,10 @@ public class WorkflowInstance {
     private String requestId;
     private int maxAttempts;
     private long backoffMillis;
+    /** 流程级默认单次执行超时上限（毫秒）；0=无上限 */
+    private long executionTimeoutMillis;
+    /** 节点级超时覆盖：nodeId -> 上限毫秒数（优先于流程级默认） */
+    private Map<String, Long> nodeExecutionTimeoutMillis = new LinkedHashMap<>();
     private WorkflowState state = WorkflowState.ACTIVE;
     /** nodeId -> 上游 nodeId 列表（依赖不可变） */
     private Map<String, java.util.List<String>> dependencies = new LinkedHashMap<>();
@@ -26,6 +30,10 @@ public class WorkflowInstance {
     public void setMaxAttempts(int maxAttempts) { this.maxAttempts = maxAttempts; }
     public long getBackoffMillis() { return backoffMillis; }
     public void setBackoffMillis(long backoffMillis) { this.backoffMillis = backoffMillis; }
+    public long getExecutionTimeoutMillis() { return executionTimeoutMillis; }
+    public void setExecutionTimeoutMillis(long executionTimeoutMillis) { this.executionTimeoutMillis = executionTimeoutMillis; }
+    public Map<String, Long> getNodeExecutionTimeoutMillis() { return nodeExecutionTimeoutMillis; }
+    public void setNodeExecutionTimeoutMillis(Map<String, Long> nodeExecutionTimeoutMillis) { this.nodeExecutionTimeoutMillis = nodeExecutionTimeoutMillis; }
     public WorkflowState getState() { return state; }
     public void setState(WorkflowState state) { this.state = state; }
     public Map<String, java.util.List<String>> getDependencies() { return dependencies; }

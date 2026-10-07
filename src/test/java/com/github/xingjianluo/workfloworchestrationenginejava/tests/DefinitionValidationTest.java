@@ -96,4 +96,34 @@ class DefinitionValidationTest {
             assertEquals(ErrorCode.CYCLE_DETECTED, e.getErrorCode());
         }
     }
+
+    @Test
+    void rejectsInvalidWorkflowLevelTimeout() {
+        WorkflowDefinition d = new WorkflowDefinition("bad-timeout", 3, 10L,
+                Map.of("a", List.of()), 0L, null);
+        WorkflowException ex = assertThrows(WorkflowException.class, () -> validator.validate(d));
+        assertEquals(ErrorCode.INVALID_DEFINITION, ex.getErrorCode());
+    }
+
+    @Test
+    void rejectsInvalidNodeLevelTimeout() {
+        WorkflowDefinition d = new WorkflowDefinition("bad-node-timeout", 3, 10L,
+                Map.of("a", List.of()), null, Map.of("a", -5L));
+        WorkflowException ex = assertThrows(WorkflowException.class, () -> validator.validate(d));
+        assertEquals(ErrorCode.INVALID_DEFINITION, ex.getErrorCode());
+    }
+
+    @Test
+    void rejectsNodeTimeoutForUndeclaredNode() {
+        WorkflowDefinition d = new WorkflowDefinition("ghost-timeout", 3, 10L,
+                Map.of("a", List.of()), null, Map.of("ghost", 100L));
+        WorkflowException ex = assertThrows(WorkflowException.class, () -> validator.validate(d));
+        assertEquals(ErrorCode.INVALID_DEFINITION, ex.getErrorCode());
+    }
+
+    @Test
+    void validTimeoutConfigPasses() {
+        validator.validate(new WorkflowDefinition("ok-timeout", 3, 10L,
+                Map.of("a", List.of(), "b", List.of("a")), 60_000L, Map.of("b", 120_000L)));
+    }
 }

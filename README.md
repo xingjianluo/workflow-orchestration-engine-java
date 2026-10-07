@@ -5,6 +5,14 @@
 同一节点在多线程抢占或进程短暂重启恢复期间，最多只被**实际提交执行结果一次**；
 租约过期后可以被安全接管而不是双跑；上游失败时下游绝不执行。
 
+针对**长耗时业务节点**（批量计算、等待外部批处理返回等，可能跑数分钟到十几分钟）：
+
+* 业务侧通过**心跳续约**告知“我还在正常干活”，节点跑再久也不会被误判失效、
+  不会被重新拉起重复执行；
+* 可为整条流程配置**单次执行时间上限**，也可对个别节点单独覆盖；
+  超时未结束的尝试按既有的失败/重试规则落状态，不会一直挂起；
+  超时判负后旧执行迟到的结果依旧被 CAS 丢弃，不会改回已发生的状态。
+
 不依赖任何外部服务（无数据库 / 无消息队列），状态以 JSON 文件落盘。
 
 ---
@@ -12,7 +20,7 @@
 ## 1. 快速开始
 
 ```bash
-# 一条命令运行全部测试（编译 + 32 个测试用例，含并发/恢复/租约场景）
+# 一条命令运行全部测试（编译 + 43 个测试用例，含并发/恢复/租约/长任务/超时场景）
 mvn test
 
 # 启动服务
@@ -30,7 +38,15 @@ curl -X POST localhost:8080/api/workflows \
   -d '{"requestId":"order-1","maxAttempts":3,"backoffMillis":500,
        "dependencies":{"a":[],"b":["a"]}}'
 
-# 查询实例状态（含每个节点状态、尝试次数、租约属主）
+# 带执行时间预算的提交：流程级默认 10 分钟，节点 a 单独放宽到 30 分钟
+curl -X POST localhost:8080/api/workflows \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"order-2","maxAttempts":3,"backoffMillis":500,
+       "dependencies":{"a":[],"b":["a"]},
+       "executionTimeoutMillis":600000,
+       "nodeExecutionTimeoutMillis":{"a":1800000}}'
+
+# 查询实例状态（含每个节点状态、尝试次数、租约属主、本次尝试的时间预算）
 curl localhost:8080/api/workflows/order-1
 
 # 暂停 / 恢复 / 取消（version 为乐观干预版本，必须等于当前 version）
@@ -142,6 +158,84 @@ PENDING/RETRY_WAIT/PAUSED ──所有上游永久失败──> CANCELLED(cascad
 
 ---
 
+## 3A. 执行时间预算与长耗时节点
+
+### 3A.1 心跳续约：长任务跑得久 ≠ 失效
+
+* 租约时长 `workflow.leaseTtlMillis`（默认 2000ms）只是“**没有心跳信号时**”的失效判定时长，
+  不是节点允许运行的最长时间。
+* 长耗时业务节点实现 `HeartbeatCapableNodeTaskHandler`，在循环/轮询等待中定期调用
+  `ctx.heartbeat()`：
+
+```java
+HeartbeatCapableNodeTaskHandler batch = (nodeId, ctx) -> {
+    while (hasMoreBatches()) {
+        runOneBatch();                 // 业务推进
+        if (!ctx.heartbeat()) {        // 续约失败 = 租约已丢失（被接管/取消/判超时）
+            return;                    // 尽快退出，避免与接管者双跑
+        }
+    }
+};
+workflowEngine.submit(definition, Map.of("batch", batch));
+```
+
+* `heartbeat()` 与结果回交走同一条“实例锁 + owner CAS + 落盘”路径：
+  只有“节点仍 RUNNING 且租约属主是自己”才续约成功；
+  已被接管/取消/判超时的执行会拿到 `false`，业务应尽早退出。
+* 只要业务持续心跳，租约就不会因“跑得久”过期，**同一节点只被真正执行一次**，
+  `attempts` 与实际执行次数始终一致。
+* 不实现心跳接口的节点行为与引入该能力前**完全一致**（租约到期可被接管）。
+
+### 3A.2 单次执行时间上限（超时预算）
+
+三级配置，优先级从高到低：
+
+| 层级 | 配置位置 | 说明 |
+|---|---|---|
+| 节点级 | `WorkflowDefinition.nodeExecutionTimeoutMillis[nodeId]` | 单个节点自己的预算，覆盖流程级 |
+| 流程级 | `WorkflowDefinition.executionTimeoutMillis` | 整条流程的默认上限 |
+| 引擎级 | `workflow.defaultExecutionTimeoutMillis`（默认 `0`） | 流程未配置时的兜底 |
+
+* 生效上限在每次租约授权时固化为 `executionDeadlineAt = 开始时间 + 上限`，
+  持久化在节点状态中，重启恢复后仍然有效。
+* `0` / 不配置 = **无上限**，行为与引入该能力前完全一致（老流程照常能跑）。
+* 心跳续约**不能**把租约续过 `executionDeadlineAt`——上限对长任务同样是硬约束。
+
+### 3A.3 超时判定与迟到结果
+
+* 调度线程扫描发现 `RUNNING` 且 `executionDeadlineAt <= now` → 判定本次尝试**超时失败**：
+  中断任务句柄（`Future.cancel(true)`）、清租约，然后**按与业务异常完全相同的规则**落状态：
+  重试预算未尽 → `RETRY_WAIT`（固定退避后自动重试）；预算耗尽 → `FAILED`（可人工重试），
+  下游按既有规则级联取消。`lastError` 记录 `execution timeout: exceeded budget ...`。
+* 判定依据是持久化的 `executionDeadlineAt`，与执行方是否存活无关：
+  “执行方拉不动”和“进程没了”同样适用（进程重启后由恢复逻辑 + 扫描接管）。
+* 超时判负后，旧执行迟到的结果在回交 CAS 处被拒绝
+  （`result REJECTED (stale owner), basis=lease-cas`），
+  **不会**把后续尝试已经发生的状态改回去。
+
+### 3A.4 运行中可观测
+
+`GET /api/workflows/{requestId}` 返回的每个节点包含：
+
+| 字段 | 含义 |
+|---|---|
+| `leaseOwner` | 当前租约属主（`executorId#uuid`），`-`/null 表示无属主 |
+| `leaseExpiresAt` | 租约过期时间（心跳会不断顺延） |
+| `executionStartedAt` | 本次尝试开始时间 |
+| `executionTimeoutMillis` | 本次尝试生效的超时上限（0=无上限） |
+| `executionDeadlineAt` | 超时截止时间；**剩余预算 = deadline − 当前时间** |
+
+状态快照日志中运行中节点附带 `budgetLeft=...ms`，便于直接观察剩余预算。
+
+### 3A.5 执行资源说明
+
+长任务持有的是 worker 线程，调度/超时判定/心跳续约都在独立线程进行，
+因此个别长任务**不会阻塞**调度循环与其它流程的判定；
+但 worker 池容量（`workflow.workerThreads`，默认 4）决定可同时运行的节点数，
+请按“预期并发长任务数 + 短任务余量”配置，避免池被长任务占满导致排队。
+
+---
+
 ## 4. 重试规则（结果可预期）
 
 * 每个节点的最大自动尝试次数 `maxAttempts`（含首次，≥1），失败后采用**固定退避**
@@ -182,28 +276,33 @@ PENDING/RETRY_WAIT/PAUSED ──所有上游永久失败──> CANCELLED(cascad
 
 引擎在关键判定点输出结构化日志，便于解释每一次状态与租约归属：
 
-* `lease granted: node=..., owner=..., attempts=..., reason=dependencies-ready|lease-expired-takeover, expiresAt=...`
+* `lease granted: node=..., owner=..., attempts=..., reason=dependencies-ready|lease-expired-takeover, expiresAt=..., timeout=...ms, deadline=...`
 * `lease takeover: ... staleOwner=... newOwner=... basis=expiresAt<=...`
+* `node=... heartbeat: owner=..., lease extended to ... (deadline=...)`
+* `node=... execution TIMEOUT: owner=..., budget=...ms, startedAt=..., now=..., attempts=...`
+* `node=... FAILED permanently ... basis=execution-timeout error=execution timeout: exceeded budget ...`
+* `node=... heartbeat REJECTED (stale owner): ...`
 * `node=... result REJECTED (stale owner): ... basis=lease-cas`
 * `node=... attempt #k failed, RETRY_WAIT until ... (backoff=...ms)`
 * `workflow state X -> Y (basis=...)`
-* 每次状态变更后的快照：`state=... version=... nodes: a=SUCCEEDED(attempts=1,owner=-) ...`
+* 每次状态变更后的快照：`state=... version=... nodes: a=RUNNING(attempts=1,owner=exec-x#y,budgetLeft=...ms) ...`
 
 ---
 
 ## 7. 本地验证方法
 
 ```bash
-# 运行全部 32 个用例（并发抢占 / 租约接管 / 进程恢复 / 重复提交 /
-# 非法依赖 / 重试上限 / 终态拒绝 / 过期干预 / REST 全栈）
+# 运行全部 43 个用例（并发抢占 / 租约接管 / 进程恢复 / 重复提交 /
+# 非法依赖 / 重试上限 / 终态拒绝 / 过期干预 / 长任务心跳 / 超时预算 / REST 全栈）
 mvn test
 
 # 只跑某一组
-mvn test -Dtest=ConcurrencyAndLeaseTest   # 并发抢占 + 租约超时接管 + 迟到结果 CAS 拒绝
-mvn test -Dtest=RecoveryTest              # 模拟崩溃后第二进程从磁盘恢复
-mvn test -Dtest=ExecutionAndRetryTest     # DAG 顺序、上游阻断、固定退避、重试上限
-mvn test -Dtest=InterventionTest          # 暂停/恢复/取消幂等/人工重试/版本过期
-mvn test -Dtest=DefinitionValidationTest  # 四类定义错误可区分
+mvn test -Dtest=ConcurrencyAndLeaseTest    # 并发抢占 + 租约超时接管 + 迟到结果 CAS 拒绝
+mvn test -Dtest=RecoveryTest               # 模拟崩溃后第二进程从磁盘恢复
+mvn test -Dtest=ExecutionAndRetryTest      # DAG 顺序、上游阻断、固定退避、重试上限
+mvn test -Dtest=InterventionTest           # 暂停/恢复/取消幂等/人工重试/版本过期
+mvn test -Dtest=DefinitionValidationTest   # 定义错误可区分（含非法超时配置）
+mvn test -Dtest=LongRunningAndTimeoutTest  # 长耗时心跳续约 / 超时预算 / 迟到结果 / 资源隔离
 ```
 
 测试特性：
@@ -212,16 +311,22 @@ mvn test -Dtest=DefinitionValidationTest  # 四类定义错误可区分
 * 租约/扫描间隔被压到 20–100ms，测试秒级完成；
 * 并发用例使用闩锁让多个节点真实同时在不同 worker 上运行，
   租约接管用例故意阻塞旧执行器直到接管发生，再放行旧任务验证其结果被拒绝；
-* 恢复用例先构造“节点已 RUNNING 且落盘”的现场，再启动第二个引擎实例验证接管与最终一致。
+* 恢复用例先构造“节点已 RUNNING 且落盘”的现场，再启动第二个引擎实例验证接管与最终一致；
+* 长任务用例让节点真实运行约 8 倍租约时长并周期心跳，验证只执行一次、attempts 不虚高；
+* 超时用例覆盖：节点级上限超时后按规则 RETRY_WAIT/FAILED、人工重试恢复、
+  流程级默认与节点级覆盖的优先级、超时接手后迟到结果不改写状态、
+  长任务不阻塞其它流程、运行中可观测属主与剩余预算；
+  每个用例日志打印 `==================== 场景: ... ====================` 与校验结论。
 
 ## 8. 主要代码结构
 
 ```
-model/        NodeState / WorkflowState / WorkflowDefinition / NodeExecution / WorkflowInstance
+model/        NodeState / WorkflowState / WorkflowDefinition（含超时预算）/ NodeExecution / WorkflowInstance
 error/        ErrorCode（可区分拒绝原因）、WorkflowException
-handler/      NodeTaskHandler（业务节点函数式接口）
+handler/      NodeTaskHandler（业务节点函数式接口）、
+              HeartbeatCapableNodeTaskHandler + NodeExecutionContext（长任务心跳续约）
 store/        WorkflowStore、JsonFileWorkflowStore（原子写 + 文件锁 + 启动扫描恢复）
-engine/       DefinitionValidator、RetryPolicy、Clock、WorkflowEngine（调度/租约/重试/干预核心）
+engine/       DefinitionValidator、RetryPolicy、Clock、WorkflowEngine（调度/租约/心跳/超时/重试/干预核心）
 config/       EngineProperties、EngineConfiguration（生命周期装配）
 web/          WorkflowController（REST + 统一错误码响应）
 ```

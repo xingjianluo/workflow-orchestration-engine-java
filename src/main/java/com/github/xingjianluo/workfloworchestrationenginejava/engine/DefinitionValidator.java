@@ -42,6 +42,20 @@ public class DefinitionValidator {
             throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
                     "backoffMillis must be >= 0 but was " + definition.backoffMillis());
         }
+        if (definition.executionTimeoutMillis() != null && definition.executionTimeoutMillis() < 1) {
+            throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
+                    "executionTimeoutMillis must be >= 1 but was " + definition.executionTimeoutMillis());
+        }
+        Map<String, Long> nodeTimeouts = definition.nodeExecutionTimeoutMillis();
+        if (nodeTimeouts != null) {
+            for (Map.Entry<String, Long> e : nodeTimeouts.entrySet()) {
+                if (e.getValue() == null || e.getValue() < 1) {
+                    throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
+                            "nodeExecutionTimeoutMillis['" + e.getKey() + "'] must be >= 1 but was "
+                                    + e.getValue());
+                }
+            }
+        }
         Map<String, List<String>> deps = definition.dependencies();
         if (deps == null || deps.isEmpty()) {
             throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
@@ -54,6 +68,15 @@ public class DefinitionValidator {
             if (!declared.add(node)) {
                 throw new WorkflowException(ErrorCode.DUPLICATE_NODE,
                         "duplicate node declared: " + node);
+            }
+        }
+        // 节点级超时必须指向已声明节点
+        if (nodeTimeouts != null) {
+            for (String nodeId : nodeTimeouts.keySet()) {
+                if (!declared.contains(nodeId)) {
+                    throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
+                            "nodeExecutionTimeoutMillis refers to undeclared node: " + nodeId);
+                }
             }
         }
         for (Map.Entry<String, List<String>> entry : deps.entrySet()) {
