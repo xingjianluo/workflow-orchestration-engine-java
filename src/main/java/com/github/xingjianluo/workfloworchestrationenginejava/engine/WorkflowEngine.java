@@ -101,11 +101,16 @@ public class WorkflowEngine {
             t.setDaemon(true);
             return t;
         });
-        workers = Executors.newFixedThreadPool(Math.max(1, properties.getWorkerThreads()), r -> {
-            Thread t = new Thread(r, "workflow-worker-" + executorId);
-            t.setDaemon(true);
-            return t;
-        });
+        workers = new java.util.concurrent.ThreadPoolExecutor(
+                Math.max(1, properties.getWorkerThreads()),
+                Math.max(Math.max(1, properties.getWorkerThreads()), properties.getMaxWorkerThreads()),
+                60L, TimeUnit.SECONDS,
+                new java.util.concurrent.SynchronousQueue<>(),
+                r -> {
+                    Thread t = new Thread(r, "workflow-worker-" + executorId);
+                    t.setDaemon(true);
+                    return t;
+                });
         if (properties.isRecoverOnStartup()) {
             recover();
         }
@@ -152,8 +157,7 @@ public class WorkflowEngine {
                 for (NodeExecution node : inst.getNodes().values()) {
                     if (node.getState() == NodeState.RUNNING) {
                         // 上次进程退出时正在执行：租约直接判过期，等待扫描器重新拉起
-                        node.setLeaseOwner(null);
-                        node.setLeaseExpiresAt(0L);
+                        clearExecution(node);
                         node.setState(NodeState.PENDING);
                         node.setNextAttemptAt(now);
                         log.info("[{}] recovery: node {} was RUNNING, reset to PENDING for takeover",
@@ -192,6 +196,7 @@ public class WorkflowEngine {
             NodeExecution n = new NodeExecution();
             n.setNodeId(nodeId);
             n.setState(NodeState.PENDING);
+            n.setExecutionTimeoutMillis(resolveTimeout(definition, nodeId));
             nodes.put(nodeId, n);
         }
         instance.setNodes(nodes);
@@ -233,6 +238,23 @@ public class WorkflowEngine {
         return instance;
     }
 
+    /**
+     * 计算节点生效的单次执行时长预算（毫秒，0=不限制）：
+     * 节点级 nodeTimeouts &gt; 流程级 executionTimeoutMillis &gt; 引擎默认 defaultExecutionTimeoutMillis。
+     */
+    private long resolveTimeout(WorkflowDefinition definition, String nodeId) {
+        if (definition.nodeTimeouts() != null) {
+            Long perNode = definition.nodeTimeouts().get(nodeId);
+            if (perNode != null) {
+                return perNode;
+            }
+        }
+        if (definition.executionTimeoutMillis() != null) {
+            return definition.executionTimeoutMillis();
+        }
+        return properties.getDefaultExecutionTimeoutMillis();
+    }
+
     private void mergeHandlers(Context target, Map<String, NodeTaskHandler> handlers,
                                WorkflowInstance instance) {
         if (handlers == null) {
@@ -254,9 +276,10 @@ public class WorkflowEngine {
     // ------------------------------------------------------------------
 
     public void pause(String requestId, long expectedVersion) {
-        WorkflowInstance inst = mustFind(requestId);
         lockInstance(requestId);
         try {
+            // 必须在锁内加载实例：锁外加载的陈旧对象全量落盘会覆盖并发的执行结果
+            WorkflowInstance inst = mustFind(requestId);
             checkVersion(inst, expectedVersion);
             if (isTerminal(inst.getState())) {
                 throw new WorkflowException(ErrorCode.ALREADY_TERMINAL,
@@ -281,9 +304,9 @@ public class WorkflowEngine {
     }
 
     public void resume(String requestId, long expectedVersion) {
-        WorkflowInstance inst = mustFind(requestId);
         lockInstance(requestId);
         try {
+            WorkflowInstance inst = mustFind(requestId);
             checkVersion(inst, expectedVersion);
             if (isTerminal(inst.getState())) {
                 throw new WorkflowException(ErrorCode.ALREADY_TERMINAL,
@@ -313,9 +336,9 @@ public class WorkflowEngine {
      * 取消：幂等。已 CANCELLED 再次取消直接返回成功；其余终态拒绝。
      */
     public void cancel(String requestId, long expectedVersion) {
-        WorkflowInstance inst = mustFind(requestId);
         lockInstance(requestId);
         try {
+            WorkflowInstance inst = mustFind(requestId);
             if (inst.getState() == WorkflowState.CANCELLED) {
                 log.info("[{}] cancel is idempotent, already CANCELLED", requestId);
                 return;
@@ -331,8 +354,7 @@ public class WorkflowEngine {
                     case PENDING, RETRY_WAIT -> {
                         n.setState(NodeState.CANCELLED);
                         n.setCascadeCancelled(false);
-                        n.setLeaseOwner(null);
-                        n.setLeaseExpiresAt(0L);
+                        clearExecution(n);
                     }
                     case RUNNING -> {
                         // 先取消任务句柄，再清租约并置 CANCELLED；
@@ -340,8 +362,7 @@ public class WorkflowEngine {
                         interruptRunning(inst, n, "workflow cancelled");
                         n.setState(NodeState.CANCELLED);
                         n.setCascadeCancelled(false);
-                        n.setLeaseOwner(null);
-                        n.setLeaseExpiresAt(0L);
+                        clearExecution(n);
                     }
                     case PAUSED -> {
                         n.setState(NodeState.CANCELLED);
@@ -365,9 +386,9 @@ public class WorkflowEngine {
      * 若流程已 FAILED，则整体回到 ACTIVE。
      */
     public void retryNode(String requestId, String nodeId, long expectedVersion) {
-        WorkflowInstance inst = mustFind(requestId);
         lockInstance(requestId);
         try {
+            WorkflowInstance inst = mustFind(requestId);
             checkVersion(inst, expectedVersion);
             NodeExecution node = inst.getNodes().get(nodeId);
             if (node == null) {
@@ -386,8 +407,7 @@ public class WorkflowEngine {
             node.setAttempts(0);
             node.setNextAttemptAt(clock.nowMillis());
             node.setLastError(null);
-            node.setLeaseOwner(null);
-            node.setLeaseExpiresAt(0L);
+            clearExecution(node);
 
             // 流程为终态 FAILED 时回到 ACTIVE；非终态（如仍有其他节点在跑）保持原状态。
             // CANCELLED/SUCCEEDED 流程不允许出现 FAILED 节点，无需处理。
@@ -445,10 +465,14 @@ public class WorkflowEngine {
         lockInstance(requestId);
         List<String> toLaunch;
         List<String> takeOver;
+        List<String> timedOut;
+        boolean renewed;
         try {
             long now = clock.nowMillis();
             toLaunch = new ArrayList<>();
             takeOver = new ArrayList<>();
+            timedOut = new ArrayList<>();
+            renewed = false;
             for (NodeExecution node : inst.getNodes().values()) {
                 switch (node.getState()) {
                     case PENDING -> {
@@ -465,8 +489,13 @@ public class WorkflowEngine {
                         }
                     }
                     case RUNNING -> {
-                        if (node.getLeaseExpiresAt() <= now) {
+                        if (isExecutionTimedOut(node, now)) {
+                            // 超过自身执行预算仍未结束：按超时失效处理，不再续约/接管
+                            timedOut.add(node.getNodeId());
+                        } else if (node.getLeaseExpiresAt() <= now) {
                             takeOver.add(node.getNodeId());
+                        } else if (shouldRenewLease(ctx, node, now)) {
+                            renewed |= renewLease(inst, node, now);
                         }
                     }
                     default -> {
@@ -480,7 +509,10 @@ public class WorkflowEngine {
             for (String nodeId : takeOver) {
                 grantLease(inst, inst.getNodes().get(nodeId), ctx, now, "lease-expired-takeover");
             }
-            if (!toLaunch.isEmpty() || !takeOver.isEmpty()) {
+            for (String nodeId : timedOut) {
+                applyExecutionTimeout(inst, inst.getNodes().get(nodeId), now);
+            }
+            if (!toLaunch.isEmpty() || !takeOver.isEmpty() || !timedOut.isEmpty() || renewed) {
                 store.save(inst);
             }
         } finally {
@@ -512,14 +544,89 @@ public class WorkflowEngine {
         node.setLeaseOwner(newOwner);
         node.setLeaseExpiresAt(now + properties.getLeaseTtlMillis());
         node.setAttempts(node.getAttempts() + 1);
-        log.info("[{}] lease granted: node={}, owner={}, attempts={}, reason={}, expiresAt={}",
+        // 记录本次尝试的执行预算窗口：超时判定以 deadline 为准，而非租约时长
+        long timeout = node.getExecutionTimeoutMillis();
+        node.setExecutionStartedAt(now);
+        node.setExecutionDeadlineAt(timeout > 0 ? now + timeout : 0L);
+        log.info("[{}] lease granted: node={}, owner={}, attempts={}, reason={}, expiresAt={}, budget={}ms, deadline={}",
                 inst.getRequestId(), node.getNodeId(), newOwner, node.getAttempts(),
-                reason, node.getLeaseExpiresAt());
+                reason, node.getLeaseExpiresAt(), timeout, node.getExecutionDeadlineAt());
         if (oldOwner != null && !oldOwner.equals(newOwner) && reason.contains("takeover")) {
             log.warn("[{}] lease takeover: node={}, staleOwner={}, newOwner={}, basis=expiresAt<={}",
                     inst.getRequestId(), node.getNodeId(), oldOwner, newOwner, now);
             interruptRunning(inst, node, "lease taken over by " + newOwner);
         }
+    }
+
+    /** 超过生效的执行预算（deadline>0 且已到期）即判超时失效 */
+    private boolean isExecutionTimedOut(NodeExecution node, long now) {
+        return node.getExecutionDeadlineAt() > 0 && now >= node.getExecutionDeadlineAt();
+    }
+
+    /**
+     * 本执行器持有的租约、剩余不足半个 TTL、且任务确实还在本执行器的 worker 上
+     * 运行时（Future 存在且未完成）才需要续约：长耗时节点只要还在正常干活，
+     * 就不会因为“跑得久”被误判过期接管；任务已结束或根本不存在的租约不续约，
+     * 交由既有租约过期/接管语义兜底。
+     */
+    private boolean shouldRenewLease(Context ctx, NodeExecution node, long now) {
+        String owner = node.getLeaseOwner();
+        if (owner == null || !owner.startsWith(executorId + "#")) {
+            return false;
+        }
+        if (node.getLeaseExpiresAt() - now >= properties.getLeaseTtlMillis() / 2) {
+            return false;
+        }
+        java.util.concurrent.Future<?> task = ctx.runningTasks.get(node.getNodeId());
+        return task != null && !task.isDone();
+    }
+
+    /** 续约：延长租约，但绝不越过本次尝试的执行预算截止时间；返回是否有实际变化 */
+    private boolean renewLease(WorkflowInstance inst, NodeExecution node, long now) {
+        long newExpiry = now + properties.getLeaseTtlMillis();
+        long deadline = node.getExecutionDeadlineAt();
+        if (deadline > 0) {
+            newExpiry = Math.min(newExpiry, deadline);
+        }
+        if (newExpiry <= node.getLeaseExpiresAt()) {
+            return false;
+        }
+        node.setLeaseExpiresAt(newExpiry);
+        log.info("[{}] lease renewed: node={}, owner={}, expiresAt={}, deadline={}",
+                inst.getRequestId(), node.getNodeId(), node.getLeaseOwner(),
+                newExpiry, node.getExecutionDeadlineAt());
+        return true;
+    }
+
+    /**
+     * 执行超时失效：中断任务句柄、清租约，按既有失败/重试规则落态
+     * （预算内还有次数则 RETRY_WAIT，耗尽则 FAILED 并级联取消下游）。
+     * 旧任务迟到回交结果时会在 complete 的 CAS 处被拒绝，不会翻转这里的状态。
+     */
+    private void applyExecutionTimeout(WorkflowInstance inst, NodeExecution node, long now) {
+        long startedAt = node.getExecutionStartedAt();
+        interruptRunning(inst, node, "execution timeout, budget=" + node.getExecutionTimeoutMillis() + "ms");
+        clearExecution(node);
+        String error = "execution timeout: exceeded budget " + node.getExecutionTimeoutMillis()
+                + "ms (ran " + (startedAt > 0 ? now - startedAt : -1) + "ms)";
+        node.setLastError(error);
+        long nextAt = retryPolicy.nextAttemptAt(
+                node.getAttempts(), inst.getMaxAttempts(), now, inst.getBackoffMillis());
+        if (nextAt < 0) {
+            node.setState(NodeState.FAILED);
+            node.setNextAttemptAt(0L);
+            log.warn("[{}] node={} execution TIMEOUT, attempts={}/{} exhausted -> FAILED; {}",
+                    inst.getRequestId(), node.getNodeId(), node.getAttempts(),
+                    inst.getMaxAttempts(), error);
+            cascadeCancelDownstream(inst, node.getNodeId());
+        } else {
+            node.setState(NodeState.RETRY_WAIT);
+            node.setNextAttemptAt(nextAt);
+            log.info("[{}] node={} execution TIMEOUT (attempt #{}), RETRY_WAIT until {}; {}",
+                    inst.getRequestId(), node.getNodeId(), node.getAttempts(), nextAt, error);
+        }
+        recomputeWorkflowState(inst, "node-" + node.getNodeId() + "-timeout");
+        inst.setUpdatedAt(now);
     }
 
     private void interruptRunning(WorkflowInstance inst, NodeExecution node, String why) {
@@ -629,15 +736,13 @@ public class WorkflowEngine {
 
             if (error == null) {
                 node.setState(NodeState.SUCCEEDED);
-                node.setLeaseOwner(null);
-                node.setLeaseExpiresAt(0L);
+                clearExecution(node);
                 log.info("[{}] node={} SUCCEEDED owner={} cost={}ms; downstream gate opened",
                         requestId, nodeId, owner, finishedAt - startedAt);
             } else {
                 long nextAt = retryPolicy.nextAttemptAt(
                         node.getAttempts(), inst.getMaxAttempts(), finishedAt, inst.getBackoffMillis());
-                node.setLeaseOwner(null);
-                node.setLeaseExpiresAt(0L);
+                clearExecution(node);
                 node.setLastError(String.valueOf(error));
                 if (nextAt < 0) {
                     node.setState(NodeState.FAILED);
@@ -755,8 +860,7 @@ public class WorkflowEngine {
                 if (allDead) {
                     childNode.setState(NodeState.CANCELLED);
                     childNode.setCascadeCancelled(true);
-                    childNode.setLeaseOwner(null);
-                    childNode.setLeaseExpiresAt(0L);
+                    clearExecution(childNode);
                     log.info("[{}] node={} CANCELLED by upstream failure propagation",
                             inst.getRequestId(), child);
                     changed = true;
@@ -793,8 +897,7 @@ public class WorkflowEngine {
                     childNode.setNextAttemptAt(clock.nowMillis());
                     childNode.setLastError(null);
                     childNode.setCascadeCancelled(false);
-                    childNode.setLeaseOwner(null);
-                    childNode.setLeaseExpiresAt(0L);
+                    clearExecution(childNode);
                     log.info("[{}] node={} reactivated after manual retry of upstream {}",
                             inst.getRequestId(), child, retriedNodeId);
                     changed = true;
@@ -803,13 +906,25 @@ public class WorkflowEngine {
         }
     }
 
+    /** 清掉租约与本次尝试的执行预算窗口（完成/失败/取消/重置时调用） */
+    private static void clearExecution(NodeExecution n) {
+        n.setLeaseOwner(null);
+        n.setLeaseExpiresAt(0L);
+        n.setExecutionStartedAt(0L);
+        n.setExecutionDeadlineAt(0L);
+    }
+
     private void logState(WorkflowInstance inst) {
+        long now = clock.nowMillis();
         StringBuilder sb = new StringBuilder();
         for (NodeExecution n : inst.getNodes().values()) {
             sb.append(n.getNodeId()).append('=').append(n.getState())
                     .append("(attempts=").append(n.getAttempts())
-                    .append(",owner=").append(n.getLeaseOwner() == null ? "-" : n.getLeaseOwner())
-                    .append(") ");
+                    .append(",owner=").append(n.getLeaseOwner() == null ? "-" : n.getLeaseOwner());
+            if (n.getState() == NodeState.RUNNING && n.getExecutionDeadlineAt() > 0) {
+                sb.append(",budgetLeft=").append(Math.max(0, n.getExecutionDeadlineAt() - now)).append("ms");
+            }
+            sb.append(") ");
         }
         log.info("[{}] state={} version={} nodes: {}",
                 inst.getRequestId(), inst.getState(), inst.getVersion(), sb.toString().trim());

@@ -42,6 +42,20 @@ public class DefinitionValidator {
             throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
                     "backoffMillis must be >= 0 but was " + definition.backoffMillis());
         }
+        if (definition.executionTimeoutMillis() != null && definition.executionTimeoutMillis() < 0) {
+            throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
+                    "executionTimeoutMillis must be >= 0 (0 = unlimited) but was "
+                            + definition.executionTimeoutMillis());
+        }
+        if (definition.nodeTimeouts() != null) {
+            for (Map.Entry<String, Long> e : definition.nodeTimeouts().entrySet()) {
+                if (e.getValue() == null || e.getValue() < 0) {
+                    throw new WorkflowException(ErrorCode.INVALID_DEFINITION,
+                            "nodeTimeouts['" + e.getKey() + "'] must be >= 0 (0 = unlimited) but was "
+                                    + e.getValue());
+                }
+            }
+        }
         Map<String, List<String>> deps = definition.dependencies();
         if (deps == null || deps.isEmpty()) {
             throw new WorkflowException(ErrorCode.INVALID_DEFINITION,

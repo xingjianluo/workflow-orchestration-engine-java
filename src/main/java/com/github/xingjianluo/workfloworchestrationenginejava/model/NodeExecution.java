@@ -13,6 +13,12 @@ public class NodeExecution {
     private long leaseExpiresAt;
     /** true=由上游失败级联取消（可被人工重试唤醒）；false=终态取消 */
     private boolean cascadeCancelled;
+    /** 该节点生效的单次执行时长预算（毫秒）；0=不限制（默认，兼容旧行为） */
+    private long executionTimeoutMillis;
+    /** 当前尝试的实际开始时刻（epoch millis）；非 RUNNING 时为 0 */
+    private long executionStartedAt;
+    /** 当前尝试的截止时刻（epoch millis）；0=无预算限制。超过即判超时失效 */
+    private long executionDeadlineAt;
 
     public String getNodeId() { return nodeId; }
     public void setNodeId(String nodeId) { this.nodeId = nodeId; }
@@ -30,4 +36,10 @@ public class NodeExecution {
     public void setLeaseExpiresAt(long leaseExpiresAt) { this.leaseExpiresAt = leaseExpiresAt; }
     public boolean isCascadeCancelled() { return cascadeCancelled; }
     public void setCascadeCancelled(boolean cascadeCancelled) { this.cascadeCancelled = cascadeCancelled; }
+    public long getExecutionTimeoutMillis() { return executionTimeoutMillis; }
+    public void setExecutionTimeoutMillis(long executionTimeoutMillis) { this.executionTimeoutMillis = executionTimeoutMillis; }
+    public long getExecutionStartedAt() { return executionStartedAt; }
+    public void setExecutionStartedAt(long executionStartedAt) { this.executionStartedAt = executionStartedAt; }
+    public long getExecutionDeadlineAt() { return executionDeadlineAt; }
+    public void setExecutionDeadlineAt(long executionDeadlineAt) { this.executionDeadlineAt = executionDeadlineAt; }
 }

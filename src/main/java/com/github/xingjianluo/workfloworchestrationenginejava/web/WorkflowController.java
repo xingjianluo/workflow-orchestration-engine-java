@@ -48,7 +48,9 @@ public class WorkflowController {
     public record SubmitRequest(String requestId,
                                 Integer maxAttempts,
                                 Long backoffMillis,
-                                Map<String, List<String>> dependencies) {
+                                Map<String, List<String>> dependencies,
+                                Long executionTimeoutMillis,
+                                Map<String, Long> nodeTimeouts) {
     }
 
     @PostMapping
@@ -57,7 +59,9 @@ public class WorkflowController {
                 request.requestId(),
                 request.maxAttempts() == null ? 1 : request.maxAttempts(),
                 request.backoffMillis() == null ? 0L : request.backoffMillis(),
-                request.dependencies());
+                request.dependencies(),
+                request.executionTimeoutMillis(),
+                request.nodeTimeouts());
         Map<String, NodeTaskHandler> handlers = new LinkedHashMap<>();
         if (def.dependencies() != null) {
             for (String nodeId : def.dependencies().keySet()) {

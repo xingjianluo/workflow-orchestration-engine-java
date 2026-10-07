@@ -12,7 +12,7 @@
 ## 1. 快速开始
 
 ```bash
-# 一条命令运行全部测试（编译 + 32 个测试用例，含并发/恢复/租约场景）
+# 一条命令运行全部测试（编译 + 38 个测试用例，含并发/恢复/租约/执行预算场景）
 mvn test
 
 # 启动服务
@@ -30,7 +30,14 @@ curl -X POST localhost:8080/api/workflows \
   -d '{"requestId":"order-1","maxAttempts":3,"backoffMillis":500,
        "dependencies":{"a":[],"b":["a"]}}'
 
-# 查询实例状态（含每个节点状态、尝试次数、租约属主）
+# 可选：配置执行时长预算——流程级默认 10 分钟，节点 b 单独覆盖为 30 分钟
+curl -X POST localhost:8080/api/workflows \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"order-2","maxAttempts":3,"backoffMillis":500,
+       "dependencies":{"a":[],"b":["a"]},
+       "executionTimeoutMillis":600000,"nodeTimeouts":{"b":1800000}}'
+
+# 查询实例状态（含每个节点状态、尝试次数、租约属主、执行预算窗口）
 curl localhost:8080/api/workflows/order-1
 
 # 暂停 / 恢复 / 取消（version 为乐观干预版本，必须等于当前 version）
@@ -140,6 +147,51 @@ PENDING/RETRY_WAIT/PAUSED ──所有上游永久失败──> CANCELLED(cascad
   多上游节点只要还有健康分支就不会被取消。
 * 人工重试让上游恢复后，级联取消的下游会按依赖关系自动重新激活。
 
+### 3.6 长耗时节点：租约续约（心跳）
+
+* 节点执行可能远超租约 TTL（`workflow.lease-ttl-millis`，默认 2000ms）。
+  调度器每轮扫描时，对**本执行器持有、任务确实还在 worker 上运行**（Future 未完成）
+  且剩余租约不足半个 TTL 的节点**自动续约**（`lease renewed` 日志），
+  因此“跑得久”本身永远不会被误判为卡死/失效，不会被重新拉起、重复执行。
+* 续约只在调度线程存活时发生：进程卡死 / GC 长停顿 / 执行器崩溃时续约停止，
+  租约自然过期，节点按 3.2 的接管语义被安全接管——活跃性与安全性兼得。
+* 最终一致性不变：同一节点“实际提交结果”仍最多一次（CAS 保证），
+  长任务场景的 `attempts` 不会因误判接管而虚高。
+
+### 3.7 执行时长预算（超时上限）
+
+* 每个节点有一次执行的**时长预算** `executionTimeoutMillis`，生效优先级：
+  **节点级 `nodeTimeouts[nodeId]` > 流程级 `executionTimeoutMillis` > 引擎默认
+  `workflow.default-execution-timeout-millis`**。`0` 或不配置 = 不限制，
+  **与引入预算前的行为完全一致**（老流程照常能跑）。
+* 授权租约时记录本次尝试窗口：`executionStartedAt=now`、
+  `executionDeadlineAt=now+预算`（无预算则为 0）；续约不会越过 deadline。
+* 扫描发现 `RUNNING` 且超过 `executionDeadlineAt` 仍未结束 → 判**执行超时失效**：
+  中断任务句柄、清租约，然后**完全按既有失败/重试规则落态**——
+  预算内还有次数则 `RETRY_WAIT`（固定退避后自动重试），
+  次数耗尽则 `FAILED` 并级联取消下游，可人工重试（`retryNode` 重置整套预算）。
+* 超时失效后被新尝试接手时，旧执行方（拉不动/进程没了又复活）**迟到回交的结果
+  会在 complete 的 CAS 处被拒绝**，不会把后续已发生的状态改回去。
+* 超时失败原因写入 `lastError`（`execution timeout: exceeded budget ...ms`），可解释。
+
+### 3.8 执行资源隔离
+
+* worker 池为核心 `workflow.worker-threads`（默认 4）+ 弹性上限
+  `workflow.max-worker-threads`（默认 64）：个别长耗时节点占住核心线程时，
+  其它流程/其它节点的可执行任务通过扩容线程照常推进，不会被顶住。
+
+### 3.9 运行中节点的可查询字段
+
+`GET /api/workflows/{requestId}` 返回的每个节点包含：
+
+| 字段 | 含义 |
+|---|---|
+| `leaseOwner` | 当前租约属主（`executorId#uuid`），运行中可看出归谁执行 |
+| `leaseExpiresAt` | 租约到期时刻（续约会推进该值） |
+| `executionTimeoutMillis` | 该节点生效的执行预算（0=不限） |
+| `executionStartedAt` | 本次尝试开始时刻 |
+| `executionDeadlineAt` | 本次尝试截止时刻；`deadline - now` 即剩余时间预算 |
+
 ---
 
 ## 4. 重试规则（结果可预期）
@@ -182,23 +234,27 @@ PENDING/RETRY_WAIT/PAUSED ──所有上游永久失败──> CANCELLED(cascad
 
 引擎在关键判定点输出结构化日志，便于解释每一次状态与租约归属：
 
-* `lease granted: node=..., owner=..., attempts=..., reason=dependencies-ready|lease-expired-takeover, expiresAt=...`
+* `lease granted: node=..., owner=..., attempts=..., reason=dependencies-ready|lease-expired-takeover, expiresAt=..., budget=...ms, deadline=...`
+* `lease renewed: node=..., owner=..., expiresAt=..., deadline=...`（长任务自动续约）
 * `lease takeover: ... staleOwner=... newOwner=... basis=expiresAt<=...`
+* `node=... execution TIMEOUT (attempt #k), RETRY_WAIT until ...; execution timeout: exceeded budget ...ms`
+* `node=... execution TIMEOUT, attempts=k/n exhausted -> FAILED; ...`
 * `node=... result REJECTED (stale owner): ... basis=lease-cas`
 * `node=... attempt #k failed, RETRY_WAIT until ... (backoff=...ms)`
 * `workflow state X -> Y (basis=...)`
-* 每次状态变更后的快照：`state=... version=... nodes: a=SUCCEEDED(attempts=1,owner=-) ...`
+* 每次状态变更后的快照：`state=... version=... nodes: a=RUNNING(attempts=1,owner=exec-x, budgetLeft=850ms) ...`
 
 ---
 
 ## 7. 本地验证方法
 
 ```bash
-# 运行全部 32 个用例（并发抢占 / 租约接管 / 进程恢复 / 重复提交 /
-# 非法依赖 / 重试上限 / 终态拒绝 / 过期干预 / REST 全栈）
+# 运行全部 38 个用例（并发抢占 / 租约接管 / 进程恢复 / 重复提交 /
+# 非法依赖 / 重试上限 / 终态拒绝 / 过期干预 / 执行预算与长任务 / REST 全栈）
 mvn test
 
 # 只跑某一组
+mvn test -Dtest=ExecutionBudgetTest       # 长任务只执行一次 / 超时按规则失败重试 / 迟到结果拒绝 / 预算层级 / 资源隔离
 mvn test -Dtest=ConcurrencyAndLeaseTest   # 并发抢占 + 租约超时接管 + 迟到结果 CAS 拒绝
 mvn test -Dtest=RecoveryTest              # 模拟崩溃后第二进程从磁盘恢复
 mvn test -Dtest=ExecutionAndRetryTest     # DAG 顺序、上游阻断、固定退避、重试上限
@@ -209,9 +265,13 @@ mvn test -Dtest=DefinitionValidationTest  # 四类定义错误可区分
 测试特性：
 
 * 全部使用 JUnit 5 + `@TempDir`，**零外部依赖**，可离线一条命令运行；
-* 租约/扫描间隔被压到 20–100ms，测试秒级完成；
+* 租约/扫描间隔被压到 20–100ms，执行预算压到 300ms 级，测试秒级完成；
 * 并发用例使用闩锁让多个节点真实同时在不同 worker 上运行，
   租约接管用例故意阻塞旧执行器直到接管发生，再放行旧任务验证其结果被拒绝；
+* 长任务用例让节点真实执行远超租约 TTL 的时长，验证续约期间不被接管、只执行一次；
+* 超时用例用“不响应中断的执行方”模拟拉不动的任务，验证超时判失效后
+  迟到结果被 CAS 拒绝、状态不回退；
+* 每个预算用例在日志中打印 `=== 场景N：... ===` 说明覆盖的业务场景与结果；
 * 恢复用例先构造“节点已 RUNNING 且落盘”的现场，再启动第二个引擎实例验证接管与最终一致。
 
 ## 8. 主要代码结构
